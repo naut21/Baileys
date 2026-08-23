@@ -743,7 +743,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				return
 			}
 
-			if (normalizeMessageContent(message)?.pinInChatMessage || normalizeMessageContent(message)?.reactionMessage) {
+			if (
+				// everyone but the private target is meant to fail decryption here, so tell their clients
+				// to drop the message instead of rendering a 'waiting for this message' placeholder
+				privateParticipant ||
+				normalizeMessageContent(message)?.pinInChatMessage ||
+				normalizeMessageContent(message)?.reactionMessage
+			) {
 				extraAttrs['decrypt-fail'] = 'hide' // todo: expand for reactions and other types
 			}
 
