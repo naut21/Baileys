@@ -12,7 +12,7 @@
 import { readFileSync, writeFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { fileURLToPath } from 'url'
-import { fetchLatestWaWebVersion } from '../src/Utils/generics.ts'
+import { fetchWaWebVersionFromSource } from '../src/Utils/generics.ts'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -108,7 +108,7 @@ function updateIndex(version: [number, number, number]): boolean {
 async function main() {
 	console.log('Fetching latest WhatsApp Web version...\n')
 
-	const result = await fetchLatestWaWebVersion()
+	const result = await fetchWaWebVersionFromSource()
 
 	if (!result.isLatest) {
 		console.error('Failed to fetch latest version:', result.error)
