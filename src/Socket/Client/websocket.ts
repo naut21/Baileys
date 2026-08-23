@@ -28,7 +28,10 @@ export class WebSocketClient extends AbstractSocketClient {
 			headers: this.config.options?.headers as {},
 			handshakeTimeout: this.config.connectTimeoutMs,
 			timeout: this.config.connectTimeoutMs,
-			agent: this.config.agent
+			agent: this.config.agent,
+			// Noise frames are already encrypted, so deflate burns CPU per frame and a zlib context per
+			// socket to save nothing. ws offers the extension by default; this stops the offer.
+			perMessageDeflate: false
 		})
 
 		this.socket.setMaxListeners(0)
