@@ -274,10 +274,11 @@ export const fetchLatestBaileysVersion = async (options: RequestInit = {}) => {
 }
 
 /**
- * A utility that fetches the latest web version of whatsapp.
- * Use to ensure your WA connection is always on the latest version
+ * Reads the WhatsApp Web version straight from web.whatsapp.com. This is what the
+ * update-wa-version workflow runs; bots should use fetchLatestWaWebVersion instead, which reads the
+ * result the workflow committed rather than hitting an endpoint that is behind anti-bot checks.
  */
-export const fetchLatestWaWebVersion = async (options: RequestInit = {}) => {
+export const fetchWaWebVersionFromSource = async (options: RequestInit = {}) => {
 	try {
 		// Absolute minimal headers required to bypass anti-bot detection
 		const defaultHeaders = {
@@ -317,6 +318,42 @@ export const fetchLatestWaWebVersion = async (options: RequestInit = {}) => {
 
 		return {
 			version: [2, 3000, +clientRevision] as WAVersion,
+			isLatest: true
+		}
+	} catch (error) {
+		return {
+			version: baileysVersion as WAVersion,
+			isLatest: false,
+			error
+		}
+	}
+}
+
+const WA_WEB_VERSION_URL = 'https://raw.githubusercontent.com/naut21/Baileys/master/src/Defaults/baileys-version.json'
+
+/**
+ * A utility that fetches the latest web version of whatsapp.
+ * Use to ensure your WA connection is always on the latest version.
+ *
+ * Reads the version this fork pins, refreshed every two hours by the update-wa-version workflow, so
+ * every bot instance hits a cached raw.githubusercontent.com file instead of scraping WhatsApp.
+ */
+export const fetchLatestWaWebVersion = async (options: RequestInit = {}) => {
+	try {
+		const response = await fetch(WA_WEB_VERSION_URL, {
+			dispatcher: options.dispatcher,
+			method: 'GET',
+			headers: options.headers
+		})
+
+		if (!response.ok) {
+			throw new Boom(`Failed to fetch latest WA Web version: ${response.statusText}`, { statusCode: response.status })
+		}
+
+		const { version } = (await response.json()) as { version: WAVersion }
+
+		return {
+			version,
 			isLatest: true
 		}
 	} catch (error) {
