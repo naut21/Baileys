@@ -588,19 +588,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			: recipientJids.map(jid => ({ recipientJid: jid, message: patched }))
 
 		let shouldIncludeDeviceIdentity = false
-		// every device of a recipient shares the same patched message object, so without this the
-		// protobuf encode and the random padding run once per device on identical bytes
-		const encoded = new Map<proto.IMessage, Uint8Array>()
-		const encodeOnce = (msg: proto.IMessage) => {
-			let bytes = encoded.get(msg)
-			if (!bytes) {
-				bytes = encodeWAMessage(msg)
-				encoded.set(msg, bytes)
-			}
-
-			return bytes
-		}
-
 		const meId = authState.creds.me!.id
 		const meLid = authState.creds.me?.lid
 		const meLidUser = meLid ? jidDecode(meLid)?.user : null
@@ -626,7 +613,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						}
 					}
 
-					const bytes = encodeOnce(msgToEncrypt)
+					const bytes = encodeWAMessage(msgToEncrypt)
 					const mutexKey = jid
 
 					const node = await encryptionMutex.mutex(mutexKey, async () => {
@@ -672,6 +659,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		{
 			messageId: msgId,
 			participant,
+			privateParticipant,
 			additionalAttributes,
 			additionalNodes,
 			useUserDevicesCache,
@@ -827,8 +815,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				for (const device of devices) {
 					const deviceJid = device.jid
 					const hasKey = !!senderKeyMap[deviceJid]
+					// with privateParticipant set, only that user's devices receive the sender key, so the
+					// skmsg in the group stanza is undecryptable for everyone who doesn't already hold it
+					const isPrivateTarget = !!privateParticipant && areJidsSameUser(deviceJid, privateParticipant)
 					if (
 						(!hasKey || !!participant) &&
+						(!privateParticipant || isPrivateTarget) &&
 						!isHostedLidUser(deviceJid) &&
 						!isHostedPnUser(deviceJid) &&
 						device.device !== 99
@@ -1299,6 +1291,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	const waUploadToServer = getWAUploadToServer(config, refreshMediaConn)
 
+	/**
+	 * Announces typing (or recording, for audio) ahead of a send. Deliberately not awaited: the
+	 * chatstate reaches the socket while the message is still being generated and encrypted, so the
+	 * indicator costs nothing on the send path. Recipients clear it when the message lands, so there
+	 * is no 'paused' to follow up with.
+	 */
 	const announceComposing = (jid: string, content: AnyMessageContent) => {
 		const isProtocolContent = 'delete' in content || 'edit' in content || 'pin' in content || 'react' in content
 		if (isProtocolContent || isJidStatusBroadcast(jid) || isJidNewsletter(jid)) {
