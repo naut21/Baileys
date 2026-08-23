@@ -59,6 +59,8 @@ import {
 	isJidBot,
 	isJidGroup,
 	isJidMetaAI,
+	isJidNewsletter,
+	isJidStatusBroadcast,
 	isLidUser,
 	isPnUser,
 	jidDecode,
@@ -95,7 +97,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		sendNode,
 		groupMetadata,
 		groupToggleEphemeral,
-		registerSocketEndHandler
+		registerSocketEndHandler,
+		sendPresenceUpdate
 	} = sock
 
 	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
@@ -489,20 +492,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const assertSessions = async (jids: string[], force?: boolean) => {
 		let didFetchNewSession = false
 		const uniqueJids = [...new Set(jids)]
-		const jidsRequiringFetch: string[] = []
 
 		logger.debug({ jids }, 'assertSessions call with jids')
 
-		for (const jid of uniqueJids) {
-			if (!force) {
-				const sessionValidation = await signalRepository.validateSession(jid)
-				if (sessionValidation.exists) {
-					continue
-				}
-			}
-
-			jidsRequiringFetch.push(jid)
-		}
+		// validateSession only reads the store, so the whole set resolves in one pass instead of
+		// one await per device before the prekey IQ can go out
+		const validations = force ? [] : await Promise.all(uniqueJids.map(jid => signalRepository.validateSession(jid)))
+		const jidsRequiringFetch = force ? uniqueJids : uniqueJids.filter((_, i) => !validations[i]!.exists)
 
 		if (jidsRequiringFetch.length) {
 			// LID if mapped, otherwise original
@@ -592,6 +588,19 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			: recipientJids.map(jid => ({ recipientJid: jid, message: patched }))
 
 		let shouldIncludeDeviceIdentity = false
+		// every device of a recipient shares the same patched message object, so without this the
+		// protobuf encode and the random padding run once per device on identical bytes
+		const encoded = new Map<proto.IMessage, Uint8Array>()
+		const encodeOnce = (msg: proto.IMessage) => {
+			let bytes = encoded.get(msg)
+			if (!bytes) {
+				bytes = encodeWAMessage(msg)
+				encoded.set(msg, bytes)
+			}
+
+			return bytes
+		}
+
 		const meId = authState.creds.me!.id
 		const meLid = authState.creds.me?.lid
 		const meLidUser = meLid ? jidDecode(meLid)?.user : null
@@ -617,7 +626,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						}
 					}
 
-					const bytes = encodeWAMessage(msgToEncrypt)
+					const bytes = encodeOnce(msgToEncrypt)
 					const mutexKey = jid
 
 					const node = await encryptionMutex.mutex(mutexKey, async () => {
@@ -1290,6 +1299,17 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	const waUploadToServer = getWAUploadToServer(config, refreshMediaConn)
 
+	const announceComposing = (jid: string, content: AnyMessageContent) => {
+		const isProtocolContent = 'delete' in content || 'edit' in content || 'pin' in content || 'react' in content
+		if (isProtocolContent || isJidStatusBroadcast(jid) || isJidNewsletter(jid)) {
+			return
+		}
+
+		sendPresenceUpdate('audio' in content ? 'recording' : 'composing', jid).catch(err =>
+			logger.debug({ err, jid }, 'could not announce composing')
+		)
+	}
+
 	const waitForMsgMediaUpdate = bindWaitForEvent(ev, 'messages.media-update')
 
 	registerSocketEndHandler(() => {
@@ -1389,6 +1409,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						: disappearingMessagesInChat
 				await groupToggleEphemeral(jid, value)
 			} else {
+				announceComposing(jid, content)
+
 				const fullMsg = await generateWAMessage(jid, content, {
 					logger,
 					userJid,
