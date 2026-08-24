@@ -111,6 +111,26 @@ import makeWASocket from '@whiskeysockets/baileys'
         - [Audio Message](#audio-message)
         - [Image Message](#image-message)
         - [ViewOnce Message](#view-once-message)
+- [Message Builders](#message-builders)
+    - [Shared Setters](#shared-setters)
+    - [Button Builder](#button-builder)
+        - [Single-select Lists](#single-select-lists)
+        - [Every Button Type](#every-button-type)
+        - [Media Headers](#media-headers)
+        - [Message Params](#message-params)
+        - [Building Without Sending](#building-without-sending)
+    - [ButtonV2 Builder](#buttonv2-builder)
+    - [Carousel Builder](#carousel-builder)
+    - [AIRich Builder](#airich-builder)
+        - [Markdown in addText](#markdown-in-addtext)
+        - [Code and Tables](#code-and-tables)
+        - [Images and Video](#images-and-video)
+        - [Cards, Sources and Pills](#cards-sources-and-pills)
+        - [Editing One Message as Content Arrives](#editing-one-message-as-content-arrives)
+        - [Hand-built Sections and Fallbacks](#hand-built-sections-and-fallbacks)
+        - [Managing Items](#managing-items)
+        - [Options](#options)
+    - [Builder Toolkit](#builder-toolkit)
 - [Modify Messages](#modify-messages)
     - [Delete Messages (for everyone)](#deleting-messages-for-everyone)
     - [Edit Messages](#editing-messages)
@@ -696,6 +716,710 @@ await sock.sendMessage(
     }
 )
 ```
+
+## Message Builders
+
+Chainable builders for the interactive message types that `sendMessage` does not cover: native flow buttons, legacy buttons, carousels, and the AI rich response layout. Ported from **MessageBuilderV4.7 by Nixel ([ValdazGT](https://gist.github.com/ValdazGT))**.
+
+| Builder | Renders |
+|---|---|
+| [`Button`](#button-builder) | Native flow buttons: quick replies, url/copy/call actions, single-select lists, optional media header |
+| [`ButtonV2`](#buttonv2-builder) | The older `buttonsMessage`, shown as a location card with plain reply buttons |
+| [`Carousel`](#carousel-builder) | A horizontally scrollable strip of `Button` cards |
+| [`AIRich`](#airich-builder) | The AI rich response layout: markdown, code, tables, media, cards, suggestion pills |
+| [`Toolkit`](#builder-toolkit) | Media and text helpers the builders use, exported for reuse |
+
+```ts
+import makeWASocket, { AIRich, Button, ButtonV2, Carousel, Toolkit } from 'baileys'
+```
+
+Every builder takes the socket, exposes `build(jid, options)` to get a `WAMessage` without sending it, and `send(jid, options)` to relay it. For `Button`, `ButtonV2` and `Carousel`, `send` also attaches the `native_flow` node WhatsApp needs to render the buttons, which is why these go out through the builder rather than through `sendMessage`.
+
+**Requirements:** `sharp` (already a peer dependency) is used to resize thumbnails. `ffmpeg` on `PATH` is only needed for `addVideo({ autoFill: true })` preview frames; without it the video is still sent, just with no preview.
+
+### Shared Setters
+
+All four builders inherit the same text slots and two escape hatches. `setTitle`, `setSubtitle`, `setBody` and `setFooter` map to a different slot in each one (see each section); `setContextInfo` and `addPayload` behave the same everywhere.
+
+```ts
+import { randomBytes } from 'crypto'
+
+new Button(sock)
+    .setContextInfo({
+        mentionedJid: ['15551234567@s.whatsapp.net'],
+        forwardingScore: 128,
+        isForwarded: true,
+        externalAdReply: {
+            title: 'Preview title',
+            body: 'Preview body',
+            thumbnailUrl: 'https://example.com/thumb.jpg',
+            sourceUrl: 'https://example.com',
+            renderLargerThumbnail: true,
+            showAdAttribution: false
+        }
+    })
+    .addPayload({ messageContextInfo: { messageSecret: randomBytes(32) } })
+```
+
+`setContextInfo` replaces the whole `contextInfo` of the message being built. `addPayload` merges extra top-level fields into the `proto.IMessage`, next to the `interactiveMessage` or `buttonsMessage` the builder produces.
+
+### Button Builder
+
+```ts
+await new Button(sock)
+    .setTitle('Order #1042')
+    .setSubtitle('Arriving today')
+    .setBody('Everything looking good?')
+    .setFooter('Support · 24/7')
+    .setImage('https://example.com/order.jpg')
+    .addReply('Confirm', 'order_confirm')
+    .addUrl('Track', 'https://example.com/track/1042')
+    .addCopy('Copy code', 'ORDER1042')
+    .addCall('Call us', '+15551234567')
+    .send(jid)
+```
+
+In `Button` the four text slots are the header title, the header subtitle, the message body and the footer.
+
+#### Reading the tap
+
+The reply id (`order_confirm`) comes back in `messages.upsert`:
+
+```ts
+sock.ev.on('messages.upsert', ({ messages }) => {
+    for (const message of messages) {
+        const response = message.message?.interactiveResponseMessage?.nativeFlowResponseMessage
+
+        if (response) {
+            const { id } = JSON.parse(response.paramsJson!)
+
+            console.log('tapped', response.name, id)
+        }
+    }
+})
+```
+
+List rows arrive the same way, with the row id under `id`. `ButtonV2` replies land in `message.buttonsResponseMessage.selectedButtonId` instead.
+
+#### Single-select lists
+
+`addSelection` opens a list, `makeSection` opens a group inside it, `makeRow` adds an entry. Rows go into the section opened last.
+
+```ts
+await new Button(sock)
+    .setBody('Pick a plan')
+    .setFooter('Cancel anytime')
+    .addSelection('Plans')
+    .makeSection('Monthly', 'popular')
+    .makeRow('', 'Basic', '5 GB storage', 'plan_basic')
+    .makeRow('', 'Pro', '100 GB storage', 'plan_pro')
+    .makeSection('Yearly')
+    .makeRow('', 'Pro Annual', '2 months free', 'plan_pro_year')
+    .send(jid)
+```
+
+#### Every button type
+
+```ts
+const button = new Button(sock)
+    .setBody('All button types')
+    .addReply('Quick reply', 'reply_id')
+    .addUrl('Open link', 'https://example.com')
+    .addUrl('Open in webview', 'https://example.com', true)
+    .addCopy('Copy', 'CODE123')
+    .addCall('Call', '+15551234567')
+    .addAddress('Send address', 'address_id')
+    .addLocation()
+    .addReminder('Remind me', 'reminder_id')
+    .addCancelReminder('Cancel reminder', 'reminder_id')
+    .addButton('cta_url', { display_text: 'Raw button', url: 'https://example.com' })
+```
+
+`addButton(name, params)` is the escape hatch: it writes the entry verbatim, so any button type WhatsApp adds later works without a library update.
+
+#### Media headers
+
+```ts
+new Button(sock).setImage('https://example.com/banner.jpg')
+new Button(sock).setImage(fs.readFileSync('./banner.jpg'))
+new Button(sock).setDocument('./invoice.pdf', { fileName: 'invoice.pdf', mimetype: 'application/pdf' })
+new Button(sock).setMedia({ video: { url: './clip.mp4' }, gifPlayback: true })
+new Button(sock).setMedia({ imageMessage: alreadyUploaded })
+```
+
+`setMedia` accepts either media still to upload (`{ image }`, `{ video }`, `{ document }`) or a message that was already uploaded (`{ imageMessage }`), which is how you reuse media across messages without uploading twice.
+
+#### Message params
+
+```ts
+await new Button(sock)
+    .setBody('Limited offer')
+    .addCopy('Copy code', 'SAVE20')
+    .setParams({
+        limited_time_offer: {
+            text: 'Offer ends soon',
+            url: 'https://example.com/offer',
+            copy_code: 'SAVE20',
+            expiration_time: Date.now() + 3600_000
+        }
+    })
+    .send(jid)
+```
+
+`Button.paramsList` documents the accepted shapes:
+
+```ts
+console.log(Button.paramsList)
+```
+
+| Entry | Fields |
+|---|---|
+| `limited_time_offer` | `text`, `url`, `copy_code`, `expiration_time` |
+| `bottom_sheet` | `in_thread_buttons_limit`, `divider_indices`, `list_title`, `button_title` |
+| `tap_target_configuration` | `title`, `description`, `canonical_url`, `domain`, `buttonIndex` |
+
+Collapsing extra buttons into a bottom sheet, so only the first two stay in the thread:
+
+```ts
+await new Button(sock)
+    .setBody('Pick an action')
+    .addReply('Accept', 'accept')
+    .addReply('Decline', 'decline')
+    .addReply('Ask later', 'later')
+    .addUrl('Open the docs', 'https://baileys.wiki')
+    .setParams({
+        bottom_sheet: {
+            in_thread_buttons_limit: 2,
+            divider_indices: [2],
+            list_title: 'More actions',
+            button_title: 'See all'
+        }
+    })
+    .send(jid)
+```
+
+#### Building without sending
+
+`build` returns the `WAMessage` and touches nothing else, which is what you want for queues, delays, or sending the same message to many chats. It takes the usual generation options (`quoted`, `messageId`, `timestamp`, `ephemeralExpiration`, `userJid`).
+
+```ts
+const draft = await new Button(sock)
+    .setBody('Reply to this')
+    .addReply('Sure', 'sure')
+    .build(jid, { quoted: message, ephemeralExpiration: 604800 })
+```
+
+Relaying it yourself later needs the same `native_flow` node `send` adds, which is exported as `createNativeFlowNode`:
+
+```ts
+import { createNativeFlowNode } from 'baileys'
+
+await sock.relayMessage(jid, draft.message!, {
+    messageId: draft.key.id!,
+    additionalNodes: [createNativeFlowNode()]
+})
+```
+
+`send` accepts the same options plus `additionalNodes`, which are appended after the `native_flow` node:
+
+```ts
+await new Button(sock)
+    .setBody('Tagged send')
+    .addReply('Ok', 'ok')
+    .send(jid, { quoted: message, additionalNodes: [{ tag: 'bot', attrs: { biz_bot: '1' } }] })
+```
+
+#### Reusing a message you already built
+
+`loadFrom` reads an interactive message back into a builder — header, body, footer, buttons, list rows and media — so the next one can be a small change on top instead of a rebuild. The uploaded media is carried over as is, so it is not uploaded twice.
+
+```ts
+const sent = await new Button(sock).setImage('./poll.jpg').setBody('Voting open').addReply('Vote', 'vote').send(jid)
+
+await new Button(sock)
+    .loadFrom(sent.message)
+    .setBody('Voting closed')
+    .clearButtons()
+    .addReply('See results', 'results')
+    .send(jid)
+```
+
+### ButtonV2 Builder
+
+The legacy `buttonsMessage`. With no media set it renders as a location card, where `setTitle` is the card name and `setSubtitle` the address line.
+
+```ts
+await new ButtonV2(sock)
+    .setTitle('Session expired')
+    .setSubtitle('Tap to continue')
+    .setBody('Your session ended. Log in again?')
+    .setFooter('Security')
+    .setThumbnail('https://example.com/lock.png')
+    .addButton('Log in', 'login_id')
+    .addButton('Not now', 'later_id')
+    .send(jid)
+```
+
+Here `setTitle` and `setSubtitle` are the location card's name and address, `setBody` is the text above the buttons, `setFooter` the line under them.
+
+#### Thumbnails and media headers
+
+```ts
+new ButtonV2(sock).setThumbnail('https://example.com/lock.png')
+new ButtonV2(sock).setThumbnail(fs.readFileSync('./lock.png'))
+new ButtonV2(sock).setRawThumbnail(fs.readFileSync('./already-300x300.jpg'))
+new ButtonV2(sock).setRawThumbnail(base64Thumbnail)
+new ButtonV2(sock).setMedia({ imageMessage: alreadyUploaded })
+new ButtonV2(sock).setMedia({ headerType: 2, text: 'Header text' })
+```
+
+`setThumbnail` fetches and resizes to 300x300. `setRawThumbnail` takes bytes or base64 that are already sized, skipping both steps. `setMedia` replaces the location card entirely with whatever header you pass.
+
+#### Raw buttons
+
+`addButton` writes a plain reply button. `addRawButton` writes the entry verbatim, which is how you get native flow actions into a legacy message:
+
+```ts
+await new ButtonV2(sock)
+    .setTitle('Invoice #77')
+    .setBody('Ready to pay?')
+    .addButton('Pay later', 'pay_later')
+    .addRawButton({
+        buttonId: 'pay_now',
+        buttonText: { displayText: 'Pay now' },
+        type: 2,
+        nativeFlowInfo: { name: 'cta_url', paramsJson: JSON.stringify({ display_text: 'Pay now', url: 'https://example.com/pay/77' }) }
+    })
+    .send(jid)
+```
+
+Leaving the id out of `addButton` generates a UUID for it. `send` throws if there are no buttons at all.
+
+#### Reusing a buttons message
+
+```ts
+const sent = await new ButtonV2(sock).setTitle('Poll').setBody('Open').addButton('Vote', 'vote').send(jid)
+
+await new ButtonV2(sock).loadFrom(sent.message).setBody('Closed').addButton('Results', 'results').send(jid)
+```
+
+### Carousel Builder
+
+Cards are `Button` instances converted with `toCard()`. Each card needs a media header, otherwise `addCard` throws.
+
+```ts
+const card = (title: string, image: string, id: string) =>
+    new Button(sock)
+        .setTitle(title)
+        .setBody(`${title} in stock`)
+        .setImage(image)
+        .addReply('Buy', `buy_${id}`)
+        .addUrl('Details', `https://example.com/p/${id}`)
+        .toCard()
+
+await new Carousel(sock)
+    .setBody('This week')
+    .setFooter('Swipe for more')
+    .addCard(await Promise.all([card('Headphones', 'https://example.com/1.jpg', '1'), card('Keyboard', 'https://example.com/2.jpg', '2')]))
+    .send(jid)
+```
+
+Only `setBody`, `setFooter` and `setContextInfo` apply to the carousel itself — the title and subtitle live on each card. `addCard` takes one card or an array, and can be called repeatedly to keep appending.
+
+#### Adding a card to a carousel you already sent
+
+```ts
+const sent = await new Carousel(sock).setBody('This week').addCard(await card('Headphones', 'https://example.com/1.jpg', '1')).send(jid)
+
+await new Carousel(sock)
+    .loadFrom(sent.message)
+    .addCard(await card('Mouse', 'https://example.com/3.jpg', '3'))
+    .send(jid)
+```
+
+### AIRich Builder
+
+Renders the layout WhatsApp uses for AI answers. Items are added in order, and each one can be named with an `id` so it can be replaced, inserted next to, or deleted later — which is what makes streaming into a single message possible.
+
+```ts
+await new AIRich(sock)
+    .setTitle('Answered by my bot')
+    .addText('Here is what I found on [Baileys](https://baileys.wiki).')
+    .addSuggest(['Show me an example', 'How do I install it?'])
+    .setFooter('Powered by my bot')
+    .send(jid)
+```
+
+`setTitle` is the small disclaimer line above the message and `setFooter` is appended as a muted line at the end. The body of the message is the items themselves, so `setBody` and `setSubtitle` do nothing here.
+
+#### Markdown in addText
+
+| Syntax | Renders as |
+|---|---|
+| `[Baileys](https://baileys.wiki)` | Tappable link labelled `Baileys` |
+| `[Baileys](!https://baileys.wiki)` | Same link, marked untrusted (WhatsApp warns before opening) |
+| `[](https://baileys.wiki)` | Numbered citation chip |
+| `[x^2 + y^2]<https://example.com/latex.png>` | Rendered LaTeX image |
+| `[x^2\|120\|60]<https://example.com/latex.png>` | Same, with an explicit width and height |
+
+```ts
+rich.addText('See [the docs](https://baileys.wiki) and this study [](https://example.com/paper).')
+rich.addText('Careful with [this link](!http://sketchy.example), it is not verified.')
+rich.addText('Plain text, no parsing', { hyperlink: false, citation: false, latex: false })
+rich.addText('Links only', { citation: false, latex: false })
+```
+
+#### The four text styles
+
+```ts
+rich.addText('Body copy, the default')
+rich.addFOAText('Follow-up answer styling, no markdown parsing')
+rich.addMetadata('Small muted line, e.g. "Generated in 1.2s"')
+rich.addTip('Muted line prefixed with an info glyph')
+```
+
+#### Code and tables
+
+```ts
+rich.addCode('javascript', `const sock = makeWASocket({ auth: state })\nsock.ev.on('messages.upsert', handle)`)
+
+rich.addTable([
+    ['Feature', 'Supported'],
+    ['[Buttons](https://baileys.wiki)', 'Yes'],
+    ['Carousel', 'Yes']
+])
+
+rich.addTable(rows, { hyperlink: false, citation: false, latex: false })
+```
+
+The first row is the header, short rows are padded to the widest one, and cells go through the same markdown extraction as `addText` unless you turn it off. Highlighting covers javascript, typescript, python, java, golang, c, cpp, php, rust, html, css and bash; anything else, including `txt`, renders as plain code.
+
+#### Images and video
+
+```ts
+rich.addImage('https://example.com/photo.jpg')
+rich.addImage(['https://example.com/1.jpg', 'https://example.com/2.jpg'])
+rich.addImage(fs.readFileSync('./photo.jpg'), { width: 1024, height: 1024 })
+rich.addImage(base64Photo)
+rich.addImage('https://example.com/photo.jpg', { resolveUrl: true })
+
+rich.addVideo('https://example.com/clip.mp4')
+rich.addVideo({ url: './clip.mp4', duration: 12, thumbnail: './cover.jpg' })
+rich.addVideo([{ url: './a.mp4' }, { url: './b.mp4', mime_type: 'video/mp4', file_length: 204800 }])
+rich.addVideo('https://example.com/clip.mp4', { autoFill: false })
+```
+
+An array of images becomes one item per image; `resolveUrl` downloads and re-uploads a url instead of linking it as is.
+
+With `autoFill` on (the default) the video is downloaded once to read its length, duration and a preview frame. Pass those fields yourself, or turn `autoFill` off, to skip the download.
+
+Both accept a placeholder state, which is what a "generating…" bubble is:
+
+```ts
+rich.addImage('', { status: 'GENERATING', update_text: 'Drawing your image…', id: 'art' })
+rich.addVideo('', { status: 'GENERATING', estimatedTime: 30_000, id: 'clip' })
+```
+
+#### Cards, sources and pills
+
+```ts
+rich.addProduct({
+    title: 'Mechanical keyboard',
+    brand: 'Example',
+    price: '$89.00',
+    sale_price: '$69.00',
+    product_url: 'https://example.com/p/1',
+    image_url: 'https://example.com/1.jpg'
+})
+
+rich.addPost({
+    username: 'baileys',
+    verified: true,
+    caption: 'New release is out',
+    thumbnail: 'https://example.com/post.jpg',
+    url: 'https://example.com/post',
+    source_app: 'INSTAGRAM'
+})
+
+rich.addReels({
+    username: 'baileys',
+    verified: true,
+    profile: 'https://example.com/avatar.jpg',
+    thumbnail: 'https://example.com/reel.jpg',
+    url: 'https://example.com/reel.mp4',
+    reels_title: 'Setting up a socket',
+    like: 1200,
+    share: 40,
+    view: 98000,
+    source: 'IG'
+})
+
+rich.addSource([
+    { icon: 'https://example.com/favicon.ico', url: 'https://baileys.wiki', title: 'Baileys', subtitle: 'Documentation' }
+])
+
+rich.addSource([['https://example.com/favicon.ico', 'https://baileys.wiki', 'Baileys', 'Documentation']])
+
+rich.addWidget({
+    title: 'Quick actions',
+    actions: [
+        { label: 'Join channel', kind: 'OTHER', state: 'PENDING', id: 'join', toast: { label: 'Joined' } },
+        { label: 'Remind me', kind: 'OTHER', state: 'PENDING', id: 'remind' }
+    ]
+})
+
+rich.addFooterAction({ text: 'Open the docs', url: 'https://baileys.wiki' })
+rich.addFooterAction([
+    { text: 'Docs', url: 'https://baileys.wiki' },
+    { text: 'Discord', url: 'https://discord.gg/WeJM5FP9GG' }
+])
+
+rich.addSuggest('Just one pill')
+rich.addSuggest(['Tell me more', 'Show an example'])
+rich.addSuggest(['Yes', 'No'], { scroll: false })
+rich.addSuggest(['A', 'B'], { layout: 'ActionRow' })
+```
+
+Media fields take a url, a buffer or base64 — anything that is not already a WhatsApp url gets uploaded first.
+
+Passing an array instead of a single object puts the cards in one horizontally scrollable row:
+
+```ts
+rich.addProduct([
+    { title: 'Keyboard', price: '$69', product_url: 'https://example.com/p/1', image_url: 'https://example.com/1.jpg' },
+    { title: 'Mouse', price: '$29', product_url: 'https://example.com/p/2', image_url: 'https://example.com/2.jpg' }
+])
+
+rich.addPost([
+    { username: 'baileys', thumbnail: 'https://example.com/a.jpg', url: 'https://example.com/a', orientation: 'PORTRAIT' },
+    { username: 'baileys', thumbnail: 'https://example.com/b.jpg', url: 'https://example.com/b', post_type: 'IMAGE' }
+])
+
+rich.addReels([
+    { username: 'baileys', thumbnail: 'https://example.com/1.jpg', url: 'https://example.com/1.mp4' },
+    { username: 'baileys', thumbnail: 'https://example.com/2.jpg', url: 'https://example.com/2.mp4' }
+])
+
+rich.addWidget([{ title: 'Today' }, { title: 'Tomorrow' }], { layout: 'HScroll' })
+```
+
+#### Editing one message as content arrives
+
+Give items an `id`, then use `insertAt` (place after that item), `replace` (swap it, keeping its position and id) and `delete`. `sendEdit()` with no arguments re-sends the whole thing as an edit of the last message this builder sent.
+
+```ts
+import { delay } from 'baileys'
+
+const rich = new AIRich(sock).setTitle('My bot').addText('Looking that up…', { id: 'status' })
+
+await rich.send(jid)
+
+rich.addImage('', { status: 'GENERATING', update_text: 'Drawing…', insertAt: 'status', id: 'art' })
+await rich.sendEdit()
+
+await delay(3000)
+
+rich.addImage('https://example.com/done.jpg', { replace: 'art' })
+rich.addText('Here it is.', { replace: 'status' })
+rich.addSuggest(['Another one', 'Make it bigger'])
+
+await rich.sendEdit()
+```
+
+`insertAt` also takes an offset, to target a neighbour of a named item: `['art', 2]` points at the item two positions after `art`. A zero or positive offset lands the new item after the one it points at, a negative offset lands it before. Helpers: `hasId(id)`, `getIds()`, `peek(id)`, `assignId(index, id)`.
+
+#### Reusing items from another builder
+
+`items` returns the raw primitives of a builder, which `addSection` can drop into a different message, mixing types inside one scrollable row.
+
+```ts
+const cards = new AIRich(sock)
+    .addProduct({ title: 'Keyboard', price: '$69', image_url: 'https://example.com/1.jpg' })
+    .addPost({ username: 'baileys', thumbnail: 'https://example.com/2.jpg' }).items
+
+rich.addSection(AIRich.newLayout('HScroll', cards), { id: 'mixed' })
+```
+
+`loadFrom` goes the other way, rebuilding a builder from a message you sent or received. Loaded items have no ids yet, so name the ones you want to move with `assignId(index, id)`:
+
+```ts
+const again = new AIRich(sock).loadFrom(received)
+
+again.assignId(0, 'first')
+again.addText('Appended right under the first item', { insertAt: 'first' })
+
+await again.sendEdit(jid, received.key.id)
+```
+
+#### Hand-built sections and fallbacks
+
+`AIRich.newLayout(name, data, extra)` wraps any primitive in a layout, which is the escape hatch for primitives the helpers do not cover. `addSection` adds it as an item, `addSubmessage` adds only the plain-text fallback with no visible item of its own.
+
+```ts
+rich.addSection(
+    AIRich.newLayout('Single', {
+        text: 'Straight from a primitive',
+        __typename: 'GenAIMarkdownTextUXPrimitive'
+    }),
+    { id: 'raw' }
+)
+
+rich.addSection([
+    AIRich.newLayout('Single', { text: 'One', __typename: 'GenAIMetadataTextPrimitive' }),
+    AIRich.newLayout('Single', { text: 'Two', __typename: 'GenAIMetadataTextPrimitive' })
+])
+
+rich.addSubmessage({ messageType: 2, messageText: 'Only visible where rich layouts are not' })
+```
+
+`'Single'` renders one primitive, `'HScroll'` a scrollable row, `'ActionRow'` a wrapped row of pills.
+
+#### Managing items
+
+```ts
+rich.getIds()
+rich.hasId('art')
+rich.peek('art')
+rich.sections
+rich.items
+rich.assignId(0, 'first')
+rich.delete('art')
+rich.delete(['art', 1])
+```
+
+| Member | Gives you |
+|---|---|
+| `getIds()` | Every id currently in use, in order |
+| `hasId(id)` | Whether that id is taken |
+| `peek(id)` | `{ id, section, submessage }` for that item, or `null` |
+| `sections` | Every section object, in order |
+| `items` | Every primitive, flattened out of its layout |
+| `assignId(index, id)` | Names an item that has no id yet, by position |
+| `delete(target)` | Removes the item and frees its id; takes an id or `[id, offset]` |
+
+Ids are unique per builder: reusing one throws `DuplicateIdError`, and targeting one that does not exist throws `ItemNotFoundError` listing the ids that do.
+
+#### Response ids
+
+Each build carries a response id and a bot response id. With `dynamic: true` (the default) both are rolled on every build, which is what keeps consecutive edits of the same message from being collapsed. Pin them when you want the opposite:
+
+```ts
+const rich = new AIRich(sock, { dynamic: false })
+
+rich.setResponseId('reply-42')
+rich.setBotResponseId('bot-42')
+
+rich.refreshResponseId()
+rich.refreshBotResponseId()
+```
+
+#### Building an edit without sending it
+
+```ts
+const sent = await rich.send(jid)
+
+rich.addText('One more line')
+
+const edit = await rich.buildEdit(jid, sent.key.id!)
+
+await sock.relayMessage(jid, edit.message!, { messageId: edit.key.id! })
+```
+
+`buildEdit` also accepts `msg` to edit in content you built elsewhere, instead of the builder's current items.
+
+#### Statics
+
+The pieces `AIRich` uses internally are exposed, so you can produce the same payloads without a builder instance:
+
+```ts
+AIRich.tokenizer('const x = 1', 'javascript')
+AIRich.toTableMetadata([['A', 'B'], ['1', '2']])
+AIRich.newLayout('HScroll', primitives)
+AIRich.generateVerificationMetadata()
+```
+
+| Static | Returns |
+|---|---|
+| `tokenizer(code, lang)` | `{ codeBlock, unified_codeBlock }`, the highlight spans for a code block |
+| `toTableMetadata(rows, options)` | `{ title, rows, unified_rows }`, a table in both representations |
+| `newLayout(name, data, extra)` | One section wrapping the primitive, or primitives, you pass |
+| `generateVerificationMetadata()` | The bot signature proofs stamped on every rich message |
+
+#### Options
+
+```ts
+new AIRich(sock, { dynamic: true, unsupportedTypeAlert: true })
+
+await rich.send(jid, {
+    forwarded: true,
+    notification: true,
+    disclaimerText: 'Answers can be wrong',
+    bypassDownload: true,
+    includesSubmessages: true,
+    includesUnifiedResponse: true,
+    quoted: message,
+    quotedParticipant: '15551234567@s.whatsapp.net',
+    messageId: generateMessageIDV2(),
+    additionalNodes: []
+})
+```
+
+| Option | Default | Effect |
+|---|---|---|
+| `dynamic` | `true` | Rolls the response ids on every build, which is what lets one message keep being edited |
+| `unsupportedTypeAlert` | `true` | Emits a plain-text placeholder for items that have no text fallback of their own |
+| `forwarded` | `true` | Stamps the message as forwarded from the AI bot, which is what unlocks the rich layout |
+| `notification` | `false` | Attaches the AI safety disclaimer banner; `disclaimerText` sets its wording |
+| `bypassDownload` | `true` | Re-sends the message as an edit right away, so the layout renders without a download |
+| `includesSubmessages` | `true` | Keeps the plain-text fallback blocks |
+| `includesUnifiedResponse` | `true` | Keeps the rich layout itself |
+| `disclaimerText` | built-in | Wording of that banner, only read when `notification` is on |
+| `quotedParticipant` | from `quoted` | Overrides who the quoted message is attributed to |
+
+`build(jid, options)` takes the same options and returns the `WAMessage` without relaying it.
+
+### Builder Toolkit
+
+```ts
+await Toolkit.toUrl(sock, './photo.jpg', 'image')
+await Toolkit.toUrl(sock, buffer, 'video')
+
+await Toolkit.resolveMedia(sock, input, 'image')
+await Toolkit.resolveMedia(sock, input, 'image', { result: 'buffer' })
+await Toolkit.resolveMedia(sock, input, 'image', { result: 'base64', resize: true, width: 300, height: 300 })
+await Toolkit.resolveMedia(sock, [first, second], 'image', { resolveUrl: true })
+
+await Toolkit.fetchBuffer('https://example.com/a.jpg')
+await Toolkit.fetchBuffer('https://example.com/a.jpg', { headers: { referer: 'https://example.com' } }, { silent: false })
+
+await Toolkit.resize(buffer, 300, 300)
+await Toolkit.resize(buffer, 300, 300, 'contain')
+
+await Toolkit.getMp4Preview(buffer, { time: 2 })
+await Toolkit.getMp4Preview(buffer, { result: 'base64', resize: false })
+
+await Toolkit.waitAllPromises(anyNestedStructure)
+
+Toolkit.getMp4Duration(buffer)
+Toolkit.getMp4Duration(buffer, { silent: false })
+Toolkit.extractIE('[Baileys](https://baileys.wiki)')
+Toolkit.extractIE(text, { hyperlink: true, citation: false, latex: false })
+Toolkit.stringifyEscaped({ note: 'año' })
+```
+
+| Helper | Returns |
+|---|---|
+| `toUrl` | Uploads a buffer, path or url and hands back a public WhatsApp url |
+| `resolveMedia` | Normalises any input to a url, buffer or base64, resizing on the way if asked |
+| `fetchBuffer` | Downloads a url; returns an empty buffer instead of throwing unless `silent: false` |
+| `resize` | Resized PNG bytes, via `sharp` |
+| `getMp4Duration` | Duration in seconds read from the container, `0` when it cannot be read |
+| `getMp4Preview` | One frame as a buffer or base64; needs `ffmpeg`, empty otherwise |
+| `extractIE` | The placeholder text plus the inline entity table for a markdown string |
+| `waitAllPromises` | The same structure with every nested promise resolved |
+| `stringifyEscaped` | JSON with every non-ASCII character escaped, the way the renderer wants its payload |
+
+Errors thrown by the builders are `Boom` for anything a caller can act on, and `AIRichError` subclasses (`ItemNotFoundError`, `DuplicateIdError`, `InvalidTargetError`, `ContentValidationError`) for item bookkeeping, each carrying a `code`.
 
 ## Modify Messages
 
