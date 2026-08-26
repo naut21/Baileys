@@ -2,7 +2,7 @@ import { Boom } from '@hapi/boom'
 import { createHash, randomBytes } from 'crypto'
 import type Long from 'long'
 import { proto } from '../../WAProto/index.js'
-const baileysVersion = [2, 3000, 1046074865]
+const baileysVersion = [2, 3000, 1046081597]
 import type {
 	BaileysEventEmitter,
 	BaileysEventMap,
