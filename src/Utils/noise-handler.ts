@@ -3,7 +3,7 @@ import { proto } from '../../WAProto/index.js'
 import { NOISE_MODE, WA_CERT_DETAILS } from '../Defaults'
 import type { KeyPair } from '../Types'
 import type { BinaryNode } from '../WABinary'
-import { decodeBinaryNode } from '../WABinary'
+import { decodeBinaryNodeSync } from '../WABinary'
 import { aesDecryptGCM, aesEncryptGCM, Curve, hkdf, sha256 } from './crypto'
 import type { ILogger } from './logger'
 
@@ -139,12 +139,18 @@ export const makeNoiseHandler = ({
 
 		if (pendingOnFrame) {
 			logger.trace({ length: inBytes.length }, 'Flushing buffered frames after transport ready')
-			await processData(pendingOnFrame)
+			processData(pendingOnFrame)
 			pendingOnFrame = null
 		}
 	}
 
-	const processData = async (onFrame: (buff: Uint8Array | BinaryNode) => void) => {
+	/**
+	 * Drains every complete frame currently buffered. Deliberately synchronous: with an await per
+	 * frame, a second websocket message arriving mid-drain started a second drain over the same
+	 * buffer and frames could be handed to onFrame out of order. Draining inline also delivers a
+	 * frame to the socket in the same tick it arrived instead of after a threadpool round trip.
+	 */
+	const processData = (onFrame: (buff: Uint8Array | BinaryNode) => void) => {
 		let size: number | undefined
 
 		while (true) {
@@ -159,7 +165,7 @@ export const makeNoiseHandler = ({
 
 			if (transport) {
 				const result = transport.decrypt(frame)
-				frame = await decodeBinaryNode(result)
+				frame = decodeBinaryNodeSync(result)
 			}
 
 			if (logger.level === 'trace') {
@@ -257,12 +263,16 @@ export const makeNoiseHandler = ({
 			}
 
 			if (inBytes.length === 0) {
-				inBytes = Buffer.from(newData)
+				// ws hands over a fresh chunk per message and never touches it again, so it can be
+				// consumed in place; copying it doubled the memory traffic of every incoming frame
+				inBytes = Buffer.isBuffer(newData)
+					? newData
+					: Buffer.from(newData.buffer, newData.byteOffset, newData.byteLength)
 			} else {
 				inBytes = Buffer.concat([inBytes, newData])
 			}
 
-			await processData(onFrame)
+			processData(onFrame)
 		}
 	}
 }

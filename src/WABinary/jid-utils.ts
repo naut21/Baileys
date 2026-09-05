@@ -54,16 +54,56 @@ export const jidEncode = (user: string | number | null, server: JidServer, devic
 
 export const jidDecode = (jid: string | undefined): FullJid | undefined => {
 	// todo: investigate how to implement hosted ids in this case
-	const sepIdx = typeof jid === 'string' ? jid.indexOf('@') : -1
+	if (typeof jid !== 'string') {
+		return undefined
+	}
+
+	const sepIdx = jid.indexOf('@')
 	if (sepIdx < 0) {
 		return undefined
 	}
 
-	const server = jid!.slice(sepIdx + 1)
-	const userCombined = jid!.slice(0, sepIdx)
+	const server = jid.slice(sepIdx + 1)
 
-	const [userAgent, device] = userCombined.split(':')
-	const [user, agent] = userAgent!.split('_')
+	// Layout is user[_agent][:device]@server. This is index arithmetic rather than split() because
+	// jidDecode runs dozens of times per stanza (every isMe/areJidsSameUser check), and each split
+	// allocated two throwaway arrays. Semantics match the split version: only the first agent and
+	// device segments count, extra ones are dropped, and empty segments read as absent.
+	let colonIdx = jid.indexOf(':')
+	if (colonIdx > sepIdx) {
+		colonIdx = -1
+	}
+
+	let userAgentEnd = sepIdx
+	let device: string | undefined
+	if (colonIdx >= 0) {
+		userAgentEnd = colonIdx
+		let deviceEnd = jid.indexOf(':', colonIdx + 1)
+		if (deviceEnd < 0 || deviceEnd > sepIdx) {
+			deviceEnd = sepIdx
+		}
+
+		device = jid.slice(colonIdx + 1, deviceEnd)
+	}
+
+	let underscoreIdx = jid.indexOf('_')
+	if (underscoreIdx > userAgentEnd) {
+		underscoreIdx = -1
+	}
+
+	let user: string
+	let agent: string | undefined
+	if (underscoreIdx >= 0) {
+		user = jid.slice(0, underscoreIdx)
+		let agentEnd = jid.indexOf('_', underscoreIdx + 1)
+		if (agentEnd < 0 || agentEnd > userAgentEnd) {
+			agentEnd = userAgentEnd
+		}
+
+		agent = jid.slice(underscoreIdx + 1, agentEnd)
+	} else {
+		user = jid.slice(0, userAgentEnd)
+	}
 
 	let domainType = WAJIDDomains.WHATSAPP
 	if (server === 'lid') {
@@ -78,7 +118,7 @@ export const jidDecode = (jid: string | undefined): FullJid | undefined => {
 
 	return {
 		server: server as JidServer,
-		user: user!,
+		user,
 		domainType,
 		device: device ? +device : undefined
 	}

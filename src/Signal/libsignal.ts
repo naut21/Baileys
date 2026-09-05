@@ -57,10 +57,19 @@ export function makeLibSignalRepository(
 
 	const parsedKeys = auth.keys as SignalKeyStoreWithTransaction
 	const migratedSessionCache = new LRUCache<string, true>({
-		ttl: 3 * 24 * 60 * 60 * 1000, // 7 days
+		ttl: 3 * 24 * 60 * 60 * 1000, // 3 days
 		ttlAutopurge: true,
 		updateAgeOnGet: true
 	})
+	/**
+	 * How long a user is remembered as fully migrated. New sessions are stored under the LID address
+	 * as soon as a mapping exists (see resolveLIDSignalAddress), so once the legacy PN sessions have
+	 * been moved there is nothing left for migrateSession to find; this is only a backstop.
+	 */
+	const MIGRATED_USER_TTL_MS = 60 * 60 * 1000
+	/** Shorter memory when no device list was stored yet: the first send to that user creates one. */
+	const NO_DEVICE_LIST_TTL_MS = 60 * 1000
+	const migratedUserKey = (user: string) => `user:${user}`
 
 	const ensureSenderKeyAndCreateSkdm = async (group: string, meId: string) => {
 		const senderName = jidToSignalSenderKeyName(group, meId)
@@ -273,11 +282,18 @@ export function makeLibSignalRepository(
 
 			const { user } = jidDecode(fromJid)!
 
+			// migrateSession runs for every inbound message that carries a LID/PN pair; without this
+			// each of them re-read the device list and every device session from the store
+			if (migratedSessionCache.has(migratedUserKey(user))) {
+				return { migrated: 0, skipped: 0, total: 0 }
+			}
+
 			logger.debug({ fromJid }, 'bulk device migration - loading all user devices')
 
 			// Get user's device list from storage
 			const { [user]: userDevices } = await parsedKeys.get('device-list', [user])
 			if (!userDevices) {
+				migratedSessionCache.set(migratedUserKey(user), true, { ttl: NO_DEVICE_LIST_TTL_MS })
 				return { migrated: 0, skipped: 0, total: 0 }
 			}
 
@@ -324,8 +340,14 @@ export function makeLibSignalRepository(
 				'bulk device migration complete - all user devices processed'
 			)
 
+			if (!deviceJids.length) {
+				// nothing left under a PN address: skip the transaction and its empty commit
+				migratedSessionCache.set(migratedUserKey(user), true, { ttl: MIGRATED_USER_TTL_MS })
+				return { migrated: 0, skipped: 0, total: 0 }
+			}
+
 			// Single transaction for all migrations
-			return parsedKeys.transaction(
+			const result = await parsedKeys.transaction(
 				async (): Promise<{ migrated: number; skipped: number; total: number }> => {
 					// Prepare migration operations with addressing metadata
 					type MigrationOp = {
@@ -401,6 +423,9 @@ export function makeLibSignalRepository(
 				},
 				`migrate-${deviceJids.length}-sessions-${jidDecode(toJid)?.user}`
 			)
+
+			migratedSessionCache.set(migratedUserKey(user), true, { ttl: MIGRATED_USER_TTL_MS })
+			return result
 		}
 	}
 

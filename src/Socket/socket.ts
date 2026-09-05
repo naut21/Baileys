@@ -1,7 +1,6 @@
 import { Boom } from '@hapi/boom'
 import { randomBytes } from 'crypto'
 import { URL } from 'url'
-import { promisify } from 'util'
 import { proto } from '../../WAProto/index.js'
 import {
 	DEF_CALLBACK_PREFIX,
@@ -137,21 +136,42 @@ export const makeSocket = (config: SocketConfig) => {
 
 	ws.connect()
 
-	const sendPromise = promisify(ws.send)
-	/** send a raw buffer */
-	const sendRawMessage = async (data: Uint8Array | Buffer) => {
+	/**
+	 * send a raw buffer
+	 *
+	 * Every ack, receipt and message goes through here, so it stays lean: one promise, one timer.
+	 * The previous promisify + promiseTimeout pair captured two stack traces and built four promises
+	 * per frame. The noise counter is advanced synchronously in encodeFrame, so frames still go out
+	 * on the wire in call order.
+	 */
+	const sendRawMessage = (data: Uint8Array | Buffer): Promise<void> => {
 		if (!ws.isOpen) {
-			throw new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed })
+			return Promise.reject(new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed }))
 		}
 
 		const bytes = noise.encodeFrame(data)
-		await promiseTimeout<void>(connectTimeoutMs, async (resolve, reject) => {
-			try {
-				await sendPromise.call(ws, bytes)
-				resolve()
-			} catch (error) {
-				reject(error)
-			}
+		return new Promise<void>((resolve, reject) => {
+			let settled = false
+			const timer = setTimeout(() => {
+				if (!settled) {
+					settled = true
+					reject(new Boom('Timed Out', { statusCode: DisconnectReason.timedOut }))
+				}
+			}, connectTimeoutMs)
+
+			ws.send(bytes, err => {
+				if (settled) {
+					return
+				}
+
+				settled = true
+				clearTimeout(timer)
+				if (err) {
+					reject(err)
+				} else {
+					resolve()
+				}
+			})
 		})
 	}
 

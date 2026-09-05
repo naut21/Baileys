@@ -19,7 +19,6 @@ type SqliteDatabase = {
 
 const CREDS_ID = 'creds'
 
-
 export const useSQLiteAuthState = (
 	path: string
 ): { state: AuthenticationState; saveCreds: () => void; close: () => void } => {
