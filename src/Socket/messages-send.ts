@@ -36,6 +36,7 @@ import {
 	parseAndInjectE2ESessions,
 	unixTimestampSeconds
 } from '../Utils'
+import { type GroupMetadataGetOptions, makeGroupMetadataCache } from '../Utils/group-metadata-cache'
 import { getUrlInfo } from '../Utils/link-preview'
 import { makeKeyedMutex, makeMutex } from '../Utils/make-mutex'
 import { getMessageReportingToken, shouldIncludeReportingToken } from '../Utils/reporting-utils'
@@ -120,46 +121,53 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const devicesMutex = makeMutex()
 
 	/**
-	 * Built-in group metadata cache, active only when the caller supplied none.
+	 * Built-in group metadata cache, in front of both the public `groupMetadata` and the group
+	 * send path (see relayMessage below). A caller-supplied `cachedGroupMetadata` is consulted
+	 * first; on a miss the built-in layer answers before any query goes out.
 	 *
-	 * Without a cache, every single group send pays a full `groupMetadata` IQ round
-	 * trip before it can encrypt (see relayMessage below). Expiry alone would be an
-	 * unsafe way to keep this fresh — a participant added between sends must not be
-	 * missed, or the message is encrypted without them and they cannot read it — so
-	 * entries are dropped on the group events instead, and the TTL is just a backstop.
+	 * Expiry alone would be an unsafe way to keep this fresh — a participant added between sends
+	 * must not be missed, or the message is encrypted without them and they cannot read it — so
+	 * entries are dropped on group events and after our own group mutations, and the TTL is just
+	 * a backstop. Full snapshots that arrive via `groups.update` (groupFetchAllParticipating) are
+	 * stored instead of dropped.
 	 */
-	const internalGroupMetadataCache =
-		cachedGroupMetadata === NO_GROUP_METADATA_CACHE
-			? new NodeCache<GroupMetadata>({ stdTTL: DEFAULT_CACHE_TTLS.GROUP_METADATA, useClones: false })
-			: undefined
+	const groupMetadataCache = makeGroupMetadataCache({
+		fetch: groupMetadata,
+		external: cachedGroupMetadata === NO_GROUP_METADATA_CACHE ? undefined : cachedGroupMetadata,
+		logger,
+		ttlSeconds: DEFAULT_CACHE_TTLS.GROUP_METADATA
+	})
 
-	const getCachedGroupMetadata = async (jid: string) => {
-		if (internalGroupMetadataCache) {
-			return internalGroupMetadataCache.get(jid)
-		}
-
-		return cachedGroupMetadata(jid)
-	}
-
-	const rememberGroupMetadata = (jid: string, metadata: GroupMetadata | undefined) => {
-		if (internalGroupMetadataCache && metadata) {
-			internalGroupMetadataCache.set(jid, metadata)
-		}
-	}
-
-	if (internalGroupMetadataCache) {
-		ev.on('groups.update', updates => {
-			for (const update of updates) {
-				if (update.id) {
-					internalGroupMetadataCache.del(update.id)
-				}
+	ev.on('groups.update', updates => {
+		for (const update of updates) {
+			if (!update.id) {
+				continue
 			}
-		})
 
-		ev.on('group-participants.update', ({ id }) => {
-			internalGroupMetadataCache.del(id)
-		})
-	}
+			if (Array.isArray(update.participants)) {
+				groupMetadataCache.remember(update as GroupMetadata)
+			} else {
+				groupMetadataCache.invalidate(update.id)
+			}
+		}
+	})
+
+	ev.on('group-participants.update', ({ id }) => {
+		groupMetadataCache.invalidate(id)
+	})
+
+	/** runs a group mutation, then drops the cached copy so the next read reflects it */
+	const invalidatingGroupMetadata =
+		<A extends unknown[], R>(mutate: (jid: string, ...args: A) => Promise<R>) =>
+		async (jid: string, ...args: A): Promise<R> => {
+			try {
+				return await mutate(jid, ...args)
+			} finally {
+				groupMetadataCache.invalidate(jid)
+			}
+		}
+
+	const groupToggleEphemeralInvalidating = invalidatingGroupMetadata(groupToggleEphemeral)
 
 	// Initialize message retry manager if enabled
 	const messageRetryManager = enableRecentMessageCache ? new MessageRetryManager(logger, maxMsgRetryCount) : null
@@ -756,14 +764,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			if (isGroupOrStatus && !isRetryResend) {
 				const [groupData, senderKeyMap] = await Promise.all([
 					(async () => {
-						let groupData = useCachedGroupMetadata ? await getCachedGroupMetadata(jid) : undefined // todo: should we rely on the cache specially if the cache is outdated and the metadata has new fields?
-						if (groupData && Array.isArray(groupData?.participants)) {
-							logger.trace({ jid, participants: groupData.participants.length }, 'using cached group metadata')
-						} else if (!isStatus) {
-							groupData = await groupMetadata(jid) // TODO: start storing group participant list + addr mode in Signal & stop relying on this
-							rememberGroupMetadata(jid, groupData)
+						if (isStatus) {
+							return undefined
 						}
 
+						// TODO: start storing group participant list + addr mode in Signal & stop relying on this
+						const groupData = await groupMetadataCache.get(jid, { fresh: !useCachedGroupMetadata })
+						logger.trace({ jid, participants: groupData.participants.length }, 'resolved group metadata')
 						return groupData
 					})(),
 					(async () => {
@@ -1325,7 +1332,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			userDevicesCache.close()
 		}
 
-		internalGroupMetadataCache?.close()
+		groupMetadataCache.close()
 
 		mediaConn = undefined
 		if (messageRetryManager) {
@@ -1335,6 +1342,21 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	return {
 		...sock,
+		/**
+		 * Group metadata, served from the built-in cache when a fresh enough copy exists.
+		 * Pass `{ fresh: true }` to force a server query.
+		 */
+		groupMetadata: (jid: string, options?: GroupMetadataGetOptions) => groupMetadataCache.get(jid, options),
+		groupParticipantsUpdate: invalidatingGroupMetadata(sock.groupParticipantsUpdate),
+		groupUpdateSubject: invalidatingGroupMetadata(sock.groupUpdateSubject),
+		groupUpdateDescription: invalidatingGroupMetadata(sock.groupUpdateDescription),
+		groupSettingUpdate: invalidatingGroupMetadata(sock.groupSettingUpdate),
+		groupToggleEphemeral: groupToggleEphemeralInvalidating,
+		groupMemberAddMode: invalidatingGroupMetadata(sock.groupMemberAddMode),
+		groupJoinApprovalMode: invalidatingGroupMetadata(sock.groupJoinApprovalMode),
+		groupRequestParticipantsUpdate: invalidatingGroupMetadata(sock.groupRequestParticipantsUpdate),
+		groupRevokeInvite: invalidatingGroupMetadata(sock.groupRevokeInvite),
+		groupLeave: invalidatingGroupMetadata(sock.groupLeave),
 		userDevicesCache,
 		devicesMutex,
 		issuePrivacyTokens,
@@ -1415,7 +1437,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							? WA_DEFAULT_EPHEMERAL
 							: 0
 						: disappearingMessagesInChat
-				await groupToggleEphemeral(jid, value)
+				await groupToggleEphemeralInvalidating(jid, value)
 			} else {
 				announceComposing(jid, content)
 

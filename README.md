@@ -266,26 +266,22 @@ const sock = makeWASocket({
 
 ## Important Notes About Socket Config
 
-### Caching Group Metadata (Recommended)
-- If you use baileys for groups, we recommend you to set `cachedGroupMetadata` in socket config, you need to implement a cache like this:
+### Group Metadata Cache (built in)
+- This fork caches group metadata for you. `sock.groupMetadata(jid)` and every group send read from a
+  built-in cache (5 minute backstop TTL) that is invalidated on `groups.update`,
+  `group-participants.update` and after your own group mutations (`groupParticipantsUpdate`,
+  `groupUpdateSubject`, `groupSettingUpdate`, ...). Concurrent requests for one group share a single
+  query, and if WhatsApp answers `rate-overlimit` the last known copy is served instead of failing.
+  You do not need the upstream `groupCache` recipe, and calling `groupMetadata` on every incoming
+  message is fine.
 
     ```ts
-    const groupCache = new NodeCache({stdTTL: 5 * 60, useClones: false})
-
-    const sock = makeWASocket({
-        cachedGroupMetadata: async (jid) => groupCache.get(jid)
-    })
-
-    sock.ev.on('groups.update', async ([event]) => {
-        const metadata = await sock.groupMetadata(event.id)
-        groupCache.set(event.id, metadata)
-    })
-
-    sock.ev.on('group-participants.update', async (event) => {
-        const metadata = await sock.groupMetadata(event.id)
-        groupCache.set(event.id, metadata)
-    })
+    const metadata = await sock.groupMetadata(jid) // cached
+    const latest = await sock.groupMetadata(jid, { fresh: true }) // forces a server query
     ```
+
+- `cachedGroupMetadata` is still honoured: when you supply it, it is consulted first and the built-in
+  cache only answers on a miss.
 
 ### Improve Retry System & Decrypt Poll Votes
 - If you want to improve sending message, retrying when error occurs and decrypt poll votes, you need to have a store and set `getMessage` config in socket like this:

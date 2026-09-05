@@ -8,7 +8,7 @@ The contributor and AI-agent guide lives in **[AGENTS.md](AGENTS.md)** — start
 
 This fork diverges from upstream WhiskeySockets/Baileys:
 
-- **Built-in group metadata cache** (`src/Socket/messages-send.ts`), active unless the caller supplies `cachedGroupMetadata`. Invalidated on group events, not by expiry.
+- **Built-in group metadata cache** (`src/Utils/group-metadata-cache.ts`, wired in `src/Socket/messages-send.ts`). Fronts both the group send path and the public `sock.groupMetadata(jid, { fresh? })`, plus the group mutation methods invalidate it. A caller-supplied `cachedGroupMetadata` is consulted first. Concurrent queries for one group coalesce; on a server `rate-overlimit` the last known copy is served, otherwise it retries briefly. Invalidated on group events (full `groups.update` snapshots are stored instead), TTL is only a backstop.
 - **`disableLinkPreviews`** config option, to skip the blocking URL fetch on the send path.
 - **Video duration and dimensions** (`src/Utils/video-metadata.ts`), read from the MP4/MOV container in-process. Upstream only computed duration for audio.
 - **Message builders** (`src/Builders/`), exported from `src/index.ts`: `Button`, `ButtonV2`, `Carousel`, `AIRich`, `Toolkit`. TypeScript port of MessageBuilderV4.7 by Nixel (ValdazGT), with `fluent-ffmpeg`/`sharp` swapped for the in-repo `parseMoovBox` reader plus the same optional-`ffmpeg` and dynamic-`sharp` handling the rest of the repo uses, so no dependencies were added. Documented in the README under "Message Builders"; tests in `src/__tests__/Builders/`.
