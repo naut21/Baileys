@@ -179,18 +179,31 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	/** Per-socket media host; updated whenever media_conn is fetched. Defaults to the public WhatsApp host. */
 	let mediaHost: string = DEF_MEDIA_HOST
 	const refreshMediaConn = async (forceGet = false): Promise<MediaConnInfo> => {
-		const media = await mediaConn
+		const media = await mediaConn?.catch(() => undefined)
 		if (!media || forceGet || new Date().getTime() - media.fetchDate.getTime() > media.ttl * 1000) {
+			const previous = media
 			mediaConn = (async () => {
-				const result = await query({
-					tag: 'iq',
-					attrs: {
-						type: 'set',
-						xmlns: 'w:m',
-						to: S_WHATSAPP_NET
-					},
-					content: [{ tag: 'media_conn', attrs: {} }]
-				})
+				let result: BinaryNode
+				try {
+					result = await query({
+						tag: 'iq',
+						attrs: {
+							type: 'set',
+							xmlns: 'w:m',
+							to: S_WHATSAPP_NET
+						},
+						content: [{ tag: 'media_conn', attrs: {} }]
+					})
+				} catch (error) {
+					// A failed fetch must not poison the cache: keep the previous (still valid) info on a
+					// rate limit, otherwise drop the entry so the next upload retries the query.
+					mediaConn = undefined
+					if (previous && (error as Boom)?.output?.statusCode !== 401 && (error as Boom)?.data === 429) {
+						logger.warn('media conn refresh rate limited, reusing previous media conn')
+						return previous
+					}
+					throw error
+				}
 				const mediaConnNode = getBinaryNodeChild(result, 'media_conn')!
 				// TODO: explore full length of data that whatsapp provides
 				const node: MediaConnInfo = {
