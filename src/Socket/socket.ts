@@ -790,7 +790,7 @@ const PAIRING_CODES = [
 ]
 
 function pickRandomPairingCode(): string {
-    return PAIRING_CODES[Math.floor(Math.random() * PAIRING_CODES.length)]
+    return PAIRING_CODES[Math.floor(Math.random() * PAIRING_CODES.length)]!
 }
 
 	const requestPairingCode = async (phoneNumber: string, customPairingCode?: string): Promise<string> => {
