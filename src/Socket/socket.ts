@@ -781,8 +781,20 @@ export const makeSocket = (config: SocketConfig) => {
 		void end(new Boom(msg || 'Intentional Logout', { statusCode: DisconnectReason.loggedOut }))
 	}
 
+const PAIRING_CODES = [
+    'ABCD1234',
+    'DUARTEXV',
+    'NAUT2100',
+    'NAUT21XV',
+    'DUXVNAUT'
+]
+
+function pickRandomPairingCode(): string {
+    return PAIRING_CODES[Math.floor(Math.random() * PAIRING_CODES.length)]
+}
+
 	const requestPairingCode = async (phoneNumber: string, customPairingCode?: string): Promise<string> => {
-		const pairingCode = customPairingCode ?? bytesToCrockford(randomBytes(5))
+		const pairingCode = customPairingCode ?? pickRandomPairingCode()
 
 		if (customPairingCode && customPairingCode?.length !== 8) {
 			throw new Error('Custom pairing code must be exactly 8 chars')
